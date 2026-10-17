@@ -1,0 +1,17 @@
+# Tracks played when the bot sits idle in voice.
+# One per line: a YouTube URL or a search query. Lines starting with # are ignored.
+Rick Astley - Never Gonna Give You Up
+Smash Mouth - All Star
+Noisestorm - Crab Rave
+Tony Igy - Astronomia (Coffin Dance)
+Nyan Cat original
+Eduard Khil - Trololo
+Darude - Sandstorm
+Bag Raiders - Shooting Stars
+Haddaway - What Is Love
+Boney M. - Rasputin
+Manuel - Gas Gas Gas
+Max Coveri - Running in the 90s
+O-Zone - Dragostea Din Tei
+Epic Sax Guy - Run Away Eurovision 2010
+Toby Fox - Megalovania

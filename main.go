@@ -6,49 +6,53 @@ import (
 	"os"
 	"os/signal"
 
-	"github.com/bwmarrin/discordgo"
+	"github.com/darui3018823/dgo"
 	"github.com/joho/godotenv"
 )
 
 var Token = flag.String("token", "", "Discord Bot Token")
 
 func main() {
-	// Load the .env file if it exists in the current directory
 	_ = godotenv.Load()
-
 	flag.Parse()
 
-	// Use the flag value if provided, otherwise fall back to BOT_TOKEN from .env
 	tokenVal := *Token
 	if tokenVal == "" {
 		tokenVal = os.Getenv("BOT_TOKEN")
 	}
-
 	if tokenVal == "" {
-		log.Fatal("Please provide your bot token via the -token flag or set BOT_TOKEN in your .env file")
+		log.Fatal("Provide a token via -token flag or BOT_TOKEN in .env")
 	}
 
-	sess, err := discordgo.New("Bot " + tokenVal)
+	sess, err := dgo.NewBot(tokenVal)
 	if err != nil {
 		log.Fatalf("Error creating Discord session: %v", err)
 	}
 
-	sess.AddHandler(func(s *discordgo.Session, r *discordgo.Ready) {
-		log.Printf("Logged in as: %s", s.State.User.Username)
+	sess.AddHandler(func(s *dgo.Session, r *dgo.Ready) {
+		log.Printf("✅ Logged in as: %s#%s", s.State.User.Username, s.State.User.Discriminator)
 	})
 
-	// Register your command handlers from modular files
+	// Register all command groups
 	RegisterWhitmanHandlers(sess)
 	RegisterLyricsHandlers(sess)
+	RegisterMusicHandlers(sess)
+	StartMemeWatcher(sess)
 
-	err = sess.Open()
-	if err != nil {
+	// Gateway Intents
+	sess.Identify.Intents = dgo.IntentsGuilds |
+		dgo.IntentsGuildMessages |
+		dgo.IntentsMessageContent |
+		dgo.IntentsGuildVoiceStates
+
+	if err = sess.Open(); err != nil {
 		log.Fatalf("Error opening connection: %v", err)
 	}
 	defer sess.Close()
 
-	log.Println("App backend is running. Press CTRL-C to exit.")
+	log.Println("Bot is running. Press CTRL-C to exit.")
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, os.Interrupt)
 	<-stop
+	log.Println("Shutting down.")
 }
