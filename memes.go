@@ -2,9 +2,11 @@ package main
 
 import (
 	_ "embed"
+	"fmt"
 	"log"
 	"math/rand/v2"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -14,23 +16,38 @@ import (
 	"whitmanBot/audio"
 )
 
-// Built-in meme list. Set MEME_FILE to use a different file without rebuilding.
+// Starting meme list, used until the first !meme add/remove saves a copy to
+// MEME_FILE.
 //
 //go:embed memes.txt
 var defaultMemes string
 
 var textChannels sync.Map // map[guildID string]string — where to announce meme tracks
 
-// memeTracks loads the list from MEME_FILE if set, otherwise the embedded one.
-func memeTracks() []string {
-	src := defaultMemes
+var memeFileMu sync.Mutex
+
+// memeFile is where the editable meme list is saved (MEME_FILE, default memes.txt).
+func memeFile() string {
 	if path := os.Getenv("MEME_FILE"); path != "" {
-		b, err := os.ReadFile(path)
-		if err != nil {
-			log.Printf("[Memes] Can't read MEME_FILE, using built-in list: %v", err)
-		} else {
-			src = string(b)
-		}
+		return path
+	}
+	return "memes.txt"
+}
+
+// memeTracks returns the saved meme list, or the built-in one if none is saved yet.
+func memeTracks() []string {
+	memeFileMu.Lock()
+	defer memeFileMu.Unlock()
+	return loadMemesLocked()
+}
+
+func loadMemesLocked() []string {
+	src := defaultMemes
+	b, err := os.ReadFile(memeFile())
+	if err == nil {
+		src = string(b)
+	} else if !os.IsNotExist(err) {
+		log.Printf("[Memes] Can't read %s, using built-in list: %v", memeFile(), err)
 	}
 
 	var tracks []string
@@ -43,9 +60,69 @@ func memeTracks() []string {
 	return tracks
 }
 
+func saveMemesLocked(tracks []string) error {
+	path := memeFile()
+	if dir := filepath.Dir(path); dir != "." {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return err
+		}
+	}
+	content := "# Tracks played when the bot sits idle in voice. Managed with !meme add/remove.\n" +
+		strings.Join(tracks, "\n") + "\n"
+	// Write to a temp file and rename so a crash can't leave a half-written list.
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, []byte(content), 0o644); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
+}
+
+// addMeme appends a track. It reports false if the track is already listed.
+func addMeme(track string) (bool, error) {
+	memeFileMu.Lock()
+	defer memeFileMu.Unlock()
+	tracks := loadMemesLocked()
+	for _, t := range tracks {
+		if strings.EqualFold(t, track) {
+			return false, nil
+		}
+	}
+	return true, saveMemesLocked(append(tracks, track))
+}
+
+// removeMeme deletes the track at the 1-based position n and returns it.
+func removeMeme(n int) (string, error) {
+	memeFileMu.Lock()
+	defer memeFileMu.Unlock()
+	tracks := loadMemesLocked()
+	if n < 1 || n > len(tracks) {
+		return "", fmt.Errorf("there's no track #%d (the list has %d)", n, len(tracks))
+	}
+	removed := tracks[n-1]
+	tracks = append(tracks[:n-1], tracks[n:]...)
+	return removed, saveMemesLocked(tracks)
+}
+
+// memeAutoplayEnabled reads MEME_AUTOPLAY (true/false, default true).
+func memeAutoplayEnabled() bool {
+	v := os.Getenv("MEME_AUTOPLAY")
+	if v == "" {
+		return true
+	}
+	enabled, err := strconv.ParseBool(v)
+	if err != nil {
+		log.Printf("[Memes] MEME_AUTOPLAY=%q isn't true/false, leaving it on", v)
+		return true
+	}
+	return enabled
+}
+
 // memeIdleTime is how long the bot must sit idle in voice before playing a
-// meme. Override with MEME_IDLE_SECONDS (0 disables memes).
+// meme. Override with MEME_IDLE_SECONDS. Returns 0 when autoplay is off.
 func memeIdleTime() time.Duration {
+	if !memeAutoplayEnabled() {
+		return 0
+	}
 	if v := os.Getenv("MEME_IDLE_SECONDS"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
 			return time.Duration(n) * time.Second
@@ -78,7 +155,7 @@ func humansInChannel(s *dgo.Session, guildID, channelID string) int {
 func StartMemeWatcher(s *dgo.Session) {
 	idle := memeIdleTime()
 	if idle <= 0 {
-		log.Println("[Memes] Disabled")
+		log.Println("[Memes] Autoplay off")
 		return
 	}
 
@@ -130,4 +207,114 @@ func playMeme(s *dgo.Session, guildID string, p *audio.Player) {
 		embed.Description = "Nobody's played anything for a while, so here's a meme."
 		_, _ = s.ChannelMessageSendEmbed(v.(string), embed)
 	}
+}
+
+// ── !meme command ─────────────────────────────────────────────────────────────
+
+const memeUsage = "❌ Usage: `!meme add <song or URL>` · `!meme list` · `!meme remove <number>`"
+
+func musicMeme(s *dgo.Session, m *dgo.MessageCreate, args []string) {
+	if len(args) == 0 {
+		_, _ = s.ChannelMessageSend(m.ChannelID, memeUsage)
+		return
+	}
+
+	switch strings.ToLower(args[0]) {
+	case "add":
+		memeAdd(s, m, strings.TrimSpace(strings.Join(args[1:], " ")))
+	case "list", "ls":
+		memeList(s, m)
+	case "remove", "rm", "delete":
+		if len(args) < 2 {
+			_, _ = s.ChannelMessageSend(m.ChannelID, "❌ Usage: `!meme remove <number>` (see `!meme list`)")
+			return
+		}
+		n, err := strconv.Atoi(args[1])
+		if err != nil {
+			_, _ = s.ChannelMessageSend(m.ChannelID, "❌ Give the track's number from `!meme list`.")
+			return
+		}
+		removed, err := removeMeme(n)
+		if err != nil {
+			_, _ = s.ChannelMessageSend(m.ChannelID, "❌ "+capitalize(err.Error())+".")
+			return
+		}
+		_, _ = s.ChannelMessageSend(m.ChannelID, fmt.Sprintf("🗑 Removed **%s** from the meme list.", removed))
+	default:
+		_, _ = s.ChannelMessageSend(m.ChannelID, memeUsage)
+	}
+}
+
+func memeAdd(s *dgo.Session, m *dgo.MessageCreate, query string) {
+	if query == "" {
+		_, _ = s.ChannelMessageSend(m.ChannelID, "❌ Usage: `!meme add <song or URL>`")
+		return
+	}
+	if strings.Contains(query, "\n") || strings.HasPrefix(query, "#") {
+		_, _ = s.ChannelMessageSend(m.ChannelID, "❌ That doesn't look like a song.")
+		return
+	}
+
+	msg, _ := s.ChannelMessageSend(m.ChannelID, "🔍 Checking that track exists...")
+	go func() {
+		// Make sure yt-dlp can actually find it before saving.
+		song, err := audio.Resolve(query, m.Author.Username)
+		if err != nil {
+			_, _ = s.ChannelMessageEdit(m.ChannelID, msg.ID, fmt.Sprintf("❌ Nothing found for **%s**", query))
+			return
+		}
+		added, err := addMeme(query)
+		switch {
+		case err != nil:
+			log.Printf("[Memes] Saving list: %v", err)
+			_, _ = s.ChannelMessageEdit(m.ChannelID, msg.ID, "❌ Couldn't save the meme list.")
+		case !added:
+			_, _ = s.ChannelMessageEdit(m.ChannelID, msg.ID, fmt.Sprintf("ℹ️ **%s** is already on the meme list.", query))
+		default:
+			_, _ = s.ChannelMessageEdit(m.ChannelID, msg.ID, fmt.Sprintf("➕ Added **%s** to the meme list (found: %s).", query, song.Title))
+		}
+	}()
+}
+
+func memeList(s *dgo.Session, m *dgo.MessageCreate) {
+	tracks := memeTracks()
+	if len(tracks) == 0 {
+		_, _ = s.ChannelMessageSend(m.ChannelID, "📭 The meme list is empty. Add one with `!meme add <song or URL>`.")
+		return
+	}
+
+	// Stay well under Discord's 4096-character embed description limit.
+	var b strings.Builder
+	shown := 0
+	for i, t := range tracks {
+		line := fmt.Sprintf("`%d.` %s\n", i+1, t)
+		if b.Len()+len(line) > 3800 {
+			break
+		}
+		b.WriteString(line)
+		shown++
+	}
+
+	status := "🎲 Autoplay is off"
+	if idle := memeIdleTime(); idle > 0 {
+		status = fmt.Sprintf("🎲 Plays after %s idle in voice", friendlyDuration(idle))
+	}
+	footer := fmt.Sprintf("%d tracks · %s", len(tracks), status)
+	if shown < len(tracks) {
+		footer = fmt.Sprintf("Showing %d of %d tracks · %s", shown, len(tracks), status)
+	}
+
+	_, _ = s.ChannelMessageSendEmbed(m.ChannelID, &dgo.MessageEmbed{
+		Title:       "🎲 Meme List",
+		Color:       0xBF00FF,
+		Description: b.String(),
+		Footer:      &dgo.MessageEmbedFooter{Text: footer},
+	})
+}
+
+func capitalize(s string) string {
+	if s == "" {
+		return s
+	}
+	return strings.ToUpper(s[:1]) + s[1:]
 }

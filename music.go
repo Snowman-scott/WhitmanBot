@@ -66,6 +66,8 @@ func RegisterMusicHandlers(s *dgo.Session) {
 			musicLoop(s, m, args)
 		case "!disconnect", "!dc":
 			musicDisconnect(s, m)
+		case "!meme", "!memes":
+			musicMeme(s, m, args)
 		case "!help", "!h":
 			musicHelp(s, m)
 		}
@@ -290,6 +292,9 @@ func musicHelp(s *dgo.Session, m *dgo.MessageCreate) {
 		{"!volume [0–100]", "Show or set the volume · `!vol`"},
 		{"!loop [off | one | queue]", "Set loop mode"},
 		{"!disconnect", "Leave the voice channel · `!dc`"},
+		{"!meme add <song or URL>", "Add a track to the AFK meme list"},
+		{"!meme list", "Show the AFK meme list"},
+		{"!meme remove <number>", "Remove a track from the AFK meme list"},
 		{"!help", "Show this message · `!h`"},
 	}
 
