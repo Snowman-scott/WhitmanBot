@@ -33,6 +33,6 @@ jobs:
         with:
           context: .
           push: true
-          tags: ghcr.io/broken-by-design/m_backend:stable
+          tags: ghcr.io/Snowman-scott/WhitmanBot:main
           cache-from: type=gha
           cache-to: type=gha,mode=max

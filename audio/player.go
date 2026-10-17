@@ -1,13 +1,10 @@
 package audio
 
 import (
-	"bytes"
 	"errors"
 	"fmt"
 	"io"
 	"log"
-	"os/exec"
-	"strings"
 	"sync"
 	"time"
 
@@ -33,8 +30,8 @@ type Player struct {
 	queue   []*Song
 	current *Song
 
-	vc  *dgo.VoiceConnection
-	cmd *exec.Cmd
+	vc     *dgo.VoiceConnection
+	stream *stream // yt-dlp | ffmpeg for the current track
 
 	skipCh chan struct{}
 
@@ -93,11 +90,9 @@ func (p *Player) Enqueue(song *Song) int {
 
 func (p *Player) Skip() {
 	p.mu.Lock()
-	cmd := p.cmd
+	st := p.stream
 	p.mu.Unlock()
-	if cmd != nil && cmd.Process != nil {
-		_ = cmd.Process.Kill()
-	}
+	st.kill()
 
 	select {
 	case p.skipCh <- struct{}{}:
@@ -121,12 +116,8 @@ func (p *Player) Stop() {
 	p.mu.Lock()
 	p.queue = nil
 	p.paused = false
-	cmd := p.cmd
 	p.mu.Unlock()
 
-	if cmd != nil && cmd.Process != nil {
-		_ = cmd.Process.Kill()
-	}
 	p.Skip()
 }
 
@@ -303,84 +294,35 @@ func (p *Player) playTrack(vc *dgo.VoiceConnection, song *Song, vol int) error {
 		return errors.New("voice connection never became ready")
 	}
 
-	args := []string{"-hide_banner", "-loglevel", "error"}
-	// Use the same headers yt-dlp used to resolve the URL, otherwise YouTube
-	// may reject the request.
-	if ua := song.Headers["User-Agent"]; ua != "" {
-		args = append(args, "-user_agent", ua)
-	}
-	var hdrs strings.Builder
-	for k, v := range song.Headers {
-		if k != "User-Agent" {
-			fmt.Fprintf(&hdrs, "%s: %s\r\n", k, v)
-		}
-	}
-	if hdrs.Len() > 0 {
-		args = append(args, "-headers", hdrs.String())
-	}
-	args = append(args,
-		"-reconnect", "1",
-		"-reconnect_streamed", "1",
-		"-reconnect_delay_max", "5",
-		"-i", song.StreamURL,
-		"-map", "0:a",
-	)
-	// Only filter when needed; at 100% the audio is passed to the encoder untouched.
-	if vol != 100 {
-		args = append(args, "-af", fmt.Sprintf("volume=%.2f", float64(vol)/100.0))
-	}
-	args = append(args,
-		"-acodec", "libopus",
-		"-f", "ogg",
-		"-ar", "48000",
-		"-ac", "2",
-		"-b:a", "160000", // YouTube's best Opus stream is ~130–160 kbps; more gains nothing
-		"-vbr", "on",
-		"-compression_level", "10",
-		"-application", "audio",
-		"-frame_duration", "20",
-		"pipe:1",
-	)
-	cmd := exec.Command("ffmpeg", args...)
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-
-	stdout, err := cmd.StdoutPipe()
+	st, err := startStream(song, vol)
 	if err != nil {
-		return fmt.Errorf("ffmpeg stdout pipe error: %w", err)
+		return err
 	}
-
-	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("ffmpeg start error: %w", err)
-	}
-
 	p.mu.Lock()
-	p.cmd = cmd
+	p.stream = st
 	p.mu.Unlock()
-
 	defer func() {
 		p.mu.Lock()
-		p.cmd = nil
+		p.stream = nil
 		p.mu.Unlock()
-		if cmd.Process != nil {
-			_ = cmd.Process.Kill()
-		}
-		_ = cmd.Wait()
-		if msg := strings.TrimSpace(stderr.String()); msg != "" {
-			log.Printf("[Player] ffmpeg: %s", msg)
-		}
+		st.close()
 	}()
 
 	_ = vc.Speaking(true)
 	defer func() {
+		sendSilence(vc)
 		_ = vc.Speaking(false)
 	}()
 
-	decoder := ogg.NewPacketDecoder(ogg.NewDecoder(stdout))
+	buf, readErr, stopReader := bufferPackets(st.out)
+	defer stopReader()
 
-	// The first 2 packets in Ogg Opus are stream metadata (OpusHead, OpusTags).
-	// We discard them and stream all subsequent packets (raw Opus audio frames).
-	skipPackets := 2
+	// Start in "buffering" mode: send silence until a cushion of audio is
+	// ready. This keeps Discord's playback clock steady instead of trickling
+	// packets out unevenly, which clients hear as speeding up and slowing down.
+	buffering := true
+	bufferingSince := time.Now()
+	wasPaused := false
 	sent := 0
 
 	for {
@@ -395,25 +337,51 @@ func (p *Player) playTrack(vc *dgo.VoiceConnection, song *Song, vol int) error {
 		p.mu.Unlock()
 
 		if paused {
+			// Packets keep queuing in buf (up to its cap), so resuming is instant.
+			if !wasPaused {
+				sendSilence(vc)
+				_ = vc.Speaking(false)
+				wasPaused = true
+			}
 			time.Sleep(100 * time.Millisecond)
 			continue
 		}
-
-		packet, _, err := decoder.Decode()
-		if err != nil {
-			if err == io.EOF || err == io.ErrUnexpectedEOF {
-				if sent == 0 {
-					return errors.New("ffmpeg produced no audio")
-				}
-				log.Printf("[Player] Sent %d packets for %q", sent, song.Title)
-				return nil
-			}
-			return fmt.Errorf("ogg decode: %w", err)
+		if wasPaused {
+			_ = vc.Speaking(true)
+			wasPaused = false
 		}
 
-		if skipPackets > 0 {
-			skipPackets--
-			continue
+		var packet []byte
+		if buffering {
+			if len(buf) >= prebufferPackets || readerDone(readErr) {
+				buffering = false
+				continue
+			}
+			if time.Since(bufferingSince) > 60*time.Second {
+				return errors.New("timed out waiting for audio")
+			}
+			packet = silenceFrame
+		} else {
+			select {
+			case pkt, ok := <-buf:
+				if !ok {
+					if err := <-readErr; err != nil {
+						return err
+					}
+					if sent == 0 {
+						return errors.New("ffmpeg produced no audio")
+					}
+					log.Printf("[Player] Sent %d packets for %q", sent, song.Title)
+					return nil
+				}
+				packet = pkt
+			default:
+				// Ran dry (download hiccup): rebuild the cushion rather than
+				// sending audio in uneven bursts.
+				buffering = true
+				bufferingSince = time.Now()
+				continue
+			}
 		}
 
 		vc.RLock()
@@ -424,7 +392,9 @@ func (p *Player) playTrack(vc *dgo.VoiceConnection, song *Song, vol int) error {
 		// Time out instead of blocking forever while claiming to be playing.
 		select {
 		case opusSend <- packet:
-			sent++
+			if !buffering {
+				sent++
+			}
 		case <-p.skipCh:
 			return nil
 		case <-time.After(5 * time.Second):
@@ -435,6 +405,81 @@ func (p *Player) playTrack(vc *dgo.VoiceConnection, song *Song, vol int) error {
 			p.mu.Unlock()
 			return errors.New("voice connection stopped accepting audio")
 		}
+	}
+}
+
+const (
+	frameDuration    = 20 * time.Millisecond
+	prebufferPackets = int(time.Second / frameDuration)     // audio held before playing
+	maxBufferPackets = int(5 * time.Second / frameDuration) // ~300 KB worst case
+)
+
+// silenceFrame is an Opus frame of silence.
+var silenceFrame = []byte{0xF8, 0xFF, 0xFE}
+
+// sendSilence sends the 5 silent frames Discord expects when audio stops, so
+// clients don't interpolate the last real frame into a glitch.
+func sendSilence(vc *dgo.VoiceConnection) {
+	vc.RLock()
+	opusSend := vc.OpusSend
+	vc.RUnlock()
+	for range 5 {
+		select {
+		case opusSend <- silenceFrame:
+		case <-time.After(time.Second):
+			return
+		}
+	}
+}
+
+// bufferPackets reads Opus packets from an Ogg stream into a bounded channel
+// in the background. The channel is closed at end of stream, after which
+// readErr yields nil (clean end) or the read error. stop ends the reader early.
+func bufferPackets(r io.Reader) (buf chan []byte, readErr chan error, stop func()) {
+	buf = make(chan []byte, maxBufferPackets)
+	readErr = make(chan error, 1)
+	done := make(chan struct{})
+
+	go func() {
+		defer close(buf)
+		decoder := ogg.NewPacketDecoder(ogg.NewDecoder(r))
+		// The first 2 packets in Ogg Opus are stream metadata (OpusHead, OpusTags).
+		for skip := 2; ; skip-- {
+			packet, _, err := decoder.Decode()
+			if err != nil {
+				if err == io.EOF || err == io.ErrUnexpectedEOF {
+					err = nil
+				} else {
+					err = fmt.Errorf("ogg decode: %w", err)
+				}
+				readErr <- err
+				return
+			}
+			if skip > 0 {
+				continue
+			}
+			select {
+			case buf <- packet:
+			case <-done:
+				readErr <- nil
+				return
+			}
+		}
+	}()
+
+	var once sync.Once
+	return buf, readErr, func() { once.Do(func() { close(done) }) }
+}
+
+// readerDone reports whether the reader has finished, without consuming its
+// result if it hasn't.
+func readerDone(readErr chan error) bool {
+	select {
+	case err := <-readErr:
+		readErr <- err // put it back for whoever handles the end of stream
+		return true
+	default:
+		return false
 	}
 }
 

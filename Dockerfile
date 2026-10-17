@@ -1,5 +1,7 @@
 # ── Build ─────────────────────────────────────────────────────────────────────
-FROM golang:1.27-trixie AS build
+# Compiles the bot. Only the finished binary is copied into the final image;
+# the source, assets/ and memes.txt are baked into that binary with go:embed.
+FROM golang:1.27-alpine AS build
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
@@ -7,16 +9,13 @@ COPY . .
 RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /whitmanBot .
 
 # ── Runtime ───────────────────────────────────────────────────────────────────
-FROM debian:trixie-slim
+FROM alpine:latest
 
 # ffmpeg encodes the audio; yt-dlp (Python) finds and fetches it; deno is the
 # JavaScript runtime yt-dlp needs to get around YouTube's player challenges.
-RUN apt-get update \
- && apt-get install -y --no-install-recommends ffmpeg python3 python3-venv ca-certificates tini \
- && rm -rf /var/lib/apt/lists/*
-COPY --from=denoland/deno:bin /deno /usr/local/bin/deno
+RUN apk add --no-cache ffmpeg python3 deno ca-certificates tini
 
-RUN useradd --create-home --uid 1000 bot \
+RUN adduser -D -u 1000 bot \
  && python3 -m venv /opt/yt-dlp \
  && /opt/yt-dlp/bin/pip install --no-cache-dir "yt-dlp[default]" \
  && chown -R bot:bot /opt/yt-dlp \
@@ -35,5 +34,5 @@ COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 
 USER bot
 WORKDIR /home/bot
-# BOT_TOKEN must be supplied at runtime (e.g. `docker run -e BOT_TOKEN=...` or --env-file .env).
-ENTRYPOINT ["tini", "--", "docker-entrypoint.sh"]
+# BOT_TOKEN must be supplied at runtime (see compose.yaml).
+ENTRYPOINT ["/sbin/tini", "--", "docker-entrypoint.sh"]

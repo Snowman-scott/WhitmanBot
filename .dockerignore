@@ -2,4 +2,5 @@
 .git
 whitmanBot
 Dockerfile
+compose.yaml
 .dockerignore

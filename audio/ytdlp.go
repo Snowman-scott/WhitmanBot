@@ -14,12 +14,13 @@ type Song struct {
 	Title       string
 	Artist      string
 	Thumbnail   string
-	Duration    int // seconds
-	StreamURL   string
-	YoutubeURL  string
+	Duration    int    // seconds
+	YoutubeURL  string // page URL; the audio itself is fetched when the track starts
 	RequestedBy string
-	Headers     map[string]string // HTTP headers ffmpeg must send for StreamURL
 }
+
+// audioFormat prefers YouTube's Opus audio, which needs the least conversion.
+const audioFormat = "bestaudio[ext=webm]/bestaudio[ext=opus]/bestaudio/best"
 
 // DurationStr returns a formatted "m:ss" string.
 func (s *Song) DurationStr() string {
@@ -41,7 +42,7 @@ func Resolve(query, requestedBy string) (*Song, error) {
 	var stderr bytes.Buffer
 	cmd := exec.Command(
 		"yt-dlp",
-		"--format", "bestaudio[ext=webm]/bestaudio[ext=opus]/bestaudio/best",
+		"--format", audioFormat,
 		"--dump-json",
 		"--no-playlist",
 		"--quiet",
@@ -77,10 +78,8 @@ func Resolve(query, requestedBy string) (*Song, error) {
 		Artist:      strVal(info, "uploader"),
 		Thumbnail:   strVal(info, "thumbnail"),
 		Duration:    intVal(info, "duration"),
-		StreamURL:   strVal(info, "url"),
 		YoutubeURL:  strVal(info, "webpage_url"),
 		RequestedBy: requestedBy,
-		Headers:     headersVal(info, "http_headers"),
 	}, nil
 }
 
@@ -105,16 +104,4 @@ func intVal(m map[string]any, key string) int {
 		}
 	}
 	return 0
-}
-
-func headersVal(m map[string]any, key string) map[string]string {
-	out := map[string]string{}
-	if h, ok := m[key].(map[string]any); ok {
-		for k, v := range h {
-			if s, ok := v.(string); ok {
-				out[k] = s
-			}
-		}
-	}
-	return out
 }
