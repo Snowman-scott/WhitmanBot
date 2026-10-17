@@ -33,6 +33,6 @@ jobs:
         with:
           context: .
           push: true
-          tags: ghcr.io/Snowman-scott/whitmanbot:main
+          tags: ghcr.io/snowman-scott/whitmanbot:main
           cache-from: type=gha
           cache-to: type=gha,mode=max
