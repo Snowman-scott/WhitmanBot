@@ -29,6 +29,12 @@ ENV MEME_FILE=/data/memes.txt
 ENV MEME_AUTOPLAY=true
 VOLUME /data
 
+# The bot touches this file every 30s while Discord is acking its heartbeats;
+# if it goes stale for 2 minutes the container is marked unhealthy.
+ENV HEALTH_FILE=/tmp/healthy
+HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
+  CMD find /tmp/healthy -mmin -2 | grep -q .
+
 COPY --from=build /whitmanBot /usr/local/bin/whitmanBot
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 
