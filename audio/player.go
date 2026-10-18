@@ -41,10 +41,9 @@ type Player struct {
 	volume   int // 0–100
 
 	idleSince time.Time // when playback last stopped (or the bot joined)
-	stopped   bool      // Stop was called and nothing has been queued since
 
 	// OnQueueEnd, if set, runs in its own goroutine when the queue runs out
-	// on its own: not after Stop, and not when the voice connection failed.
+	// right after a track played without error (finished or skipped).
 	OnQueueEnd func()
 }
 
@@ -101,10 +100,12 @@ func (p *Player) dropVoiceLocked() {
 // Returns the 1-based queue position, or 0 if it will play immediately.
 func (p *Player) Enqueue(song *Song) int {
 	p.mu.Lock()
-	p.stopped = false
 	p.queue = append(p.queue, song)
 	pos := len(p.queue)
 	wasPlaying := p.playing
+	// Claim playback here, under the lock, so two songs queued at the same
+	// moment can't each start their own playback loop.
+	p.playing = true
 	p.mu.Unlock()
 
 	if !wasPlaying {
@@ -142,7 +143,6 @@ func (p *Player) Stop() {
 	p.mu.Lock()
 	p.queue = nil
 	p.paused = false
-	p.stopped = true
 	p.mu.Unlock()
 
 	p.Skip()
@@ -210,13 +210,6 @@ func (p *Player) IsPlaying() bool {
 	return p.playing
 }
 
-// WasStopped reports whether Stop was called with nothing queued since.
-func (p *Player) WasStopped() bool {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	return p.stopped
-}
-
 func (p *Player) IsPaused() bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -255,22 +248,16 @@ func (p *Player) GetVolume() int {
 
 // ── Internal playback ─────────────────────────────────────────────────────────
 
+// playbackLoop plays the queue until it's empty. Enqueue sets p.playing
+// before starting it.
 func (p *Player) playbackLoop() {
-	p.mu.Lock()
-	p.playing = true
-	p.mu.Unlock()
-
-	ranOut := false // the queue emptied after a track played without error
+	finished := false
+	lastOK := false // the last track played without error
 	defer func() {
-		p.mu.Lock()
-		p.playing = false
-		p.current = nil
-		p.paused = false
-		p.idleSince = time.Now()
-		autoplay := ranOut && !p.stopped && p.OnQueueEnd != nil
-		p.mu.Unlock()
-		if autoplay {
-			go p.OnQueueEnd()
+		if !finished {
+			p.mu.Lock()
+			p.finishLocked()
+			p.mu.Unlock()
 		}
 	}()
 
@@ -303,10 +290,17 @@ func (p *Player) playbackLoop() {
 		}
 
 		if next == nil {
+			// Finish while still holding the lock, so a song queued right now
+			// starts a new loop instead of being left behind in this one.
+			p.finishLocked()
+			finished = true
+			onEnd := p.OnQueueEnd
 			p.mu.Unlock()
+			if lastOK && onEnd != nil {
+				go onEnd()
+			}
 			return
 		}
-		ranOut = false
 
 		p.current = next
 		vc := p.vc
@@ -317,11 +311,11 @@ func (p *Player) playbackLoop() {
 			return
 		}
 
-		if err := p.playTrack(vc, next, vol); err != nil {
+		err := p.playTrack(vc, next, vol)
+		if err != nil {
 			log.Printf("[Player] Playback finished for %q (%v)", next.Title, err)
-		} else {
-			ranOut = true
 		}
+		lastOK = err == nil
 
 		// Drain any leftover skip signal from a completed track
 		select {
@@ -329,6 +323,14 @@ func (p *Player) playbackLoop() {
 		default:
 		}
 	}
+}
+
+// finishLocked marks playback as stopped. p.mu must be held.
+func (p *Player) finishLocked() {
+	p.playing = false
+	p.current = nil
+	p.paused = false
+	p.idleSince = time.Now()
 }
 
 func (p *Player) playTrack(vc *dgo.VoiceConnection, song *Song, vol int) error {

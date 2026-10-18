@@ -150,8 +150,8 @@ func humansInChannel(s *dgo.Session, guildID, channelID string) int {
 	return n
 }
 
-// StartMemeWatcher plays a random meme track whenever the bot has been idle
-// in a voice channel (with people in it) for memeIdleTime.
+// StartMemeWatcher starts a meme run whenever the bot has been idle in a
+// voice channel (with people in it) for memeIdleTime.
 func StartMemeWatcher(s *dgo.Session) {
 	idle := memeIdleTime()
 	if idle <= 0 {
@@ -175,15 +175,48 @@ func StartMemeWatcher(s *dgo.Session) {
 
 				// Restart the timer now so we don't fire again while resolving.
 				p.ResetIdle()
-				go playMeme(s, guildID, p, "🎲 Too quiet in here...", "Nobody's played anything for a while, so here's a meme.")
+				go playNextMeme(s, guildID, p, true)
 				return true
 			})
 		}
 	}()
 }
 
-// autoplayMeme keeps the music going with a meme once the queue runs out.
-func autoplayMeme(s *dgo.Session, guildID string, p *audio.Player) {
+// A meme run starts once the bot has sat idle for memeIdleTime. It plays the
+// whole meme list in a shuffled order, back to back while the queue stays
+// empty, then moves on to !random picks once every meme has played. Queueing
+// a song by hand (or !stop) ends the run, so the next one gets the full list.
+type memeRun struct {
+	left   []string // memes not played yet this run
+	played int
+}
+
+var (
+	memeRunsMu sync.Mutex
+	memeRuns   = map[string]*memeRun{} // guildID → current run
+)
+
+func endMemeRun(guildID string) {
+	memeRunsMu.Lock()
+	defer memeRunsMu.Unlock()
+	delete(memeRuns, guildID)
+}
+
+// next returns the run's next search query, and whether it came from the
+// meme list (as opposed to a random pick once the list is used up).
+func (r *memeRun) next() (query string, fromList bool, n int) {
+	memeRunsMu.Lock()
+	defer memeRunsMu.Unlock()
+	r.played++
+	if len(r.left) > 0 {
+		query, r.left = r.left[0], r.left[1:]
+		return query, true, r.played
+	}
+	return randomPick(""), false, r.played
+}
+
+// continueMemeRun plays the next meme when the queue empties mid-run.
+func continueMemeRun(s *dgo.Session, guildID string, p *audio.Player) {
 	if !memeAutoplayEnabled() {
 		return
 	}
@@ -192,32 +225,64 @@ func autoplayMeme(s *dgo.Session, guildID string, p *audio.Player) {
 		return
 	}
 	p.ResetIdle()
-	playMeme(s, guildID, p, "📻 Queue's empty...", "So here's a meme. Queue something with `!play`, or `!stop` to make it stop.")
+	playNextMeme(s, guildID, p, false)
 }
 
-func playMeme(s *dgo.Session, guildID string, p *audio.Player, title, description string) {
-	tracks := memeTracks()
-	if len(tracks) == 0 {
+// playNextMeme queues the next track of the guild's meme run. With start set
+// it begins a new run if none is going; otherwise it only continues one.
+func playNextMeme(s *dgo.Session, guildID string, p *audio.Player, start bool) {
+	memeRunsMu.Lock()
+	run := memeRuns[guildID]
+	if run == nil && start {
+		tracks := memeTracks()
+		rand.Shuffle(len(tracks), func(i, j int) { tracks[i], tracks[j] = tracks[j], tracks[i] })
+		run = &memeRun{left: tracks}
+		memeRuns[guildID] = run
+	}
+	memeRunsMu.Unlock()
+	if run == nil {
 		return
 	}
 
-	query := tracks[rand.IntN(len(tracks))]
-	song, err := audio.Resolve(query, "🎲 AFK memes")
-	if err != nil {
+	// Skip past a few tracks yt-dlp can't find rather than going quiet.
+	var song *audio.Song
+	var fromList bool
+	var n int
+	for range 3 {
+		var query string
+		query, fromList, n = run.next()
+		var err error
+		if song, err = audio.Resolve(query, "🎲 AFK memes"); err == nil {
+			break
+		}
 		log.Printf("[Memes] Couldn't resolve %q: %v", query, err)
+	}
+	if song == nil {
 		return
 	}
 
 	// Someone may have queued a song or hit !stop while we were resolving.
-	if p.IsPlaying() || p.WasStopped() || p.ChannelID() == "" {
+	memeRunsMu.Lock()
+	current := memeRuns[guildID] == run
+	memeRunsMu.Unlock()
+	if !current || p.IsPlaying() || p.ChannelID() == "" {
 		return
 	}
 	p.Enqueue(song)
 
 	if v, ok := textChannels.Load(guildID); ok {
 		embed := nowPlayingEmbed(song)
-		embed.Author.Name = title
-		embed.Description = description
+		switch {
+		case n == 1:
+			embed.Author.Name = "🎲 Too quiet in here..."
+			embed.Description = "Nobody's played anything for a while, so here's a meme."
+		case fromList:
+			embed.Author.Name = fmt.Sprintf("🎲 Meme #%d", n)
+			embed.Description = "Queue's still empty, so here's another. `!play` something to take over."
+		default:
+			embed.Author.Name = "🎲 Out of memes..."
+			embed.Description = "That's every meme on the list, so here's a random song instead."
+		}
 		_, _ = s.ChannelMessageSendEmbed(v.(string), embed)
 	}
 }

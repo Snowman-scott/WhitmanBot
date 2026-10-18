@@ -5,6 +5,7 @@ import (
 	"math/rand/v2"
 	"slices"
 	"strings"
+	"sync"
 
 	"github.com/darui3018823/dgo"
 )
@@ -158,8 +159,39 @@ func randomPick(tag string) string {
 			chaosThings[rand.IntN(len(chaosThings))],
 			chaosStyles[rand.IntN(len(chaosStyles))])
 	}
-	songs := randomTags[tag]
-	return songs[rand.IntN(len(songs))]
+	return pickFresh("random:"+tag, randomTags[tag])
+}
+
+var (
+	recentMu    sync.Mutex
+	recentPicks = map[string][]string{} // key → most recent picks, newest last
+)
+
+// pickFresh picks a random option, skipping anything picked recently under
+// the same key, so the same song doesn't come up twice in a row. Up to half
+// the list is held back, so a 16-song list won't repeat within 8 picks.
+func pickFresh(key string, options []string) string {
+	recentMu.Lock()
+	defer recentMu.Unlock()
+
+	recent := recentPicks[key]
+	fresh := make([]string, 0, len(options))
+	for _, o := range options {
+		if !slices.Contains(recent, o) {
+			fresh = append(fresh, o)
+		}
+	}
+	if len(fresh) == 0 {
+		fresh = options
+	}
+	pick := fresh[rand.IntN(len(fresh))]
+
+	recent = append(recent, pick)
+	if keep := len(options) / 2; len(recent) > keep {
+		recent = recent[len(recent)-keep:]
+	}
+	recentPicks[key] = recent
+	return pick
 }
 
 func musicRandom(s *dgo.Session, m *dgo.MessageCreate, args []string) {

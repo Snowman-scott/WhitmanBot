@@ -18,7 +18,7 @@ func getOrCreatePlayer(s *dgo.Session, guildID string) *audio.Player {
 		return v.(*audio.Player)
 	}
 	p := audio.NewPlayer(s, guildID)
-	p.OnQueueEnd = func() { autoplayMeme(s, guildID, p) }
+	p.OnQueueEnd = func() { continueMemeRun(s, guildID, p) }
 	v, _ := players.LoadOrStore(guildID, p)
 	return v.(*audio.Player)
 }
@@ -131,6 +131,8 @@ func playQueries(s *dgo.Session, m *dgo.MessageCreate, queries []string, note st
 		}
 		stageNote := speakOnStage(s, m.GuildID, vcID)
 
+		// A song queued by hand ends any meme run; the next one starts fresh.
+		endMemeRun(m.GuildID)
 		pos := p.Enqueue(song)
 
 		var embed *dgo.MessageEmbed
@@ -197,12 +199,14 @@ func musicResume(s *dgo.Session, m *dgo.MessageCreate) {
 
 func musicStop(s *dgo.Session, m *dgo.MessageCreate) {
 	p := getOrCreatePlayer(s, m.GuildID)
+	endMemeRun(m.GuildID)
 	p.Stop()
 	_, _ = s.ChannelMessageSend(m.ChannelID, "⏹ Stopped and queue cleared.")
 }
 
 func musicDisconnect(s *dgo.Session, m *dgo.MessageCreate) {
 	p := getOrCreatePlayer(s, m.GuildID)
+	endMemeRun(m.GuildID)
 	p.Disconnect()
 	_, _ = s.ChannelMessageSend(m.ChannelID, "👋 Disconnected.")
 }
