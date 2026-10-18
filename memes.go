@@ -175,14 +175,27 @@ func StartMemeWatcher(s *dgo.Session) {
 
 				// Restart the timer now so we don't fire again while resolving.
 				p.ResetIdle()
-				go playMeme(s, guildID, p)
+				go playMeme(s, guildID, p, "🎲 Too quiet in here...", "Nobody's played anything for a while, so here's a meme.")
 				return true
 			})
 		}
 	}()
 }
 
-func playMeme(s *dgo.Session, guildID string, p *audio.Player) {
+// autoplayMeme keeps the music going with a meme once the queue runs out.
+func autoplayMeme(s *dgo.Session, guildID string, p *audio.Player) {
+	if !memeAutoplayEnabled() {
+		return
+	}
+	vcID := p.ChannelID()
+	if vcID == "" || humansInChannel(s, guildID, vcID) == 0 {
+		return
+	}
+	p.ResetIdle()
+	playMeme(s, guildID, p, "📻 Queue's empty...", "So here's a meme. Queue something with `!play`, or `!stop` to make it stop.")
+}
+
+func playMeme(s *dgo.Session, guildID string, p *audio.Player, title, description string) {
 	tracks := memeTracks()
 	if len(tracks) == 0 {
 		return
@@ -195,16 +208,16 @@ func playMeme(s *dgo.Session, guildID string, p *audio.Player) {
 		return
 	}
 
-	// Someone may have queued a song while we were resolving.
-	if p.IsPlaying() || p.ChannelID() == "" {
+	// Someone may have queued a song or hit !stop while we were resolving.
+	if p.IsPlaying() || p.WasStopped() || p.ChannelID() == "" {
 		return
 	}
 	p.Enqueue(song)
 
 	if v, ok := textChannels.Load(guildID); ok {
 		embed := nowPlayingEmbed(song)
-		embed.Author.Name = "🎲 Too quiet in here..."
-		embed.Description = "Nobody's played anything for a while, so here's a meme."
+		embed.Author.Name = title
+		embed.Description = description
 		_, _ = s.ChannelMessageSendEmbed(v.(string), embed)
 	}
 }
@@ -255,23 +268,23 @@ func memeAdd(s *dgo.Session, m *dgo.MessageCreate, query string) {
 		return
 	}
 
-	msg, _ := s.ChannelMessageSend(m.ChannelID, "🔍 Checking that track exists...")
+	status := sendStatus(s, m.ChannelID, "🔍 Checking that track exists...")
 	go func() {
 		// Make sure yt-dlp can actually find it before saving.
 		song, err := audio.Resolve(query, m.Author.Username)
 		if err != nil {
-			_, _ = s.ChannelMessageEdit(m.ChannelID, msg.ID, fmt.Sprintf("❌ Nothing found for **%s**", query))
+			status.text(fmt.Sprintf("❌ Nothing found for **%s**", query))
 			return
 		}
 		added, err := addMeme(query)
 		switch {
 		case err != nil:
 			log.Printf("[Memes] Saving list: %v", err)
-			_, _ = s.ChannelMessageEdit(m.ChannelID, msg.ID, "❌ Couldn't save the meme list.")
+			status.text("❌ Couldn't save the meme list.")
 		case !added:
-			_, _ = s.ChannelMessageEdit(m.ChannelID, msg.ID, fmt.Sprintf("ℹ️ **%s** is already on the meme list.", query))
+			status.text(fmt.Sprintf("ℹ️ **%s** is already on the meme list.", query))
 		default:
-			_, _ = s.ChannelMessageEdit(m.ChannelID, msg.ID, fmt.Sprintf("➕ Added **%s** to the meme list (found: %s).", query, song.Title))
+			status.text(fmt.Sprintf("➕ Added **%s** to the meme list (found: %s).", query, song.Title))
 		}
 	}()
 }

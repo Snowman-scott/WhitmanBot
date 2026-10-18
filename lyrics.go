@@ -54,7 +54,7 @@ func RegisterLyricsHandlers(sess *dgo.Session) {
 			},
 		})
 		if err != nil {
-			log.Fatalf("Cannot create lyrics slash command: %v", err)
+			log.Printf("Cannot create lyrics slash command: %v", err)
 		}
 	})
 

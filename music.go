@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"log"
 	"strings"
 	"sync"
 	"time"
@@ -13,7 +14,12 @@ import (
 var players sync.Map // map[guildID string]*audio.Player
 
 func getOrCreatePlayer(s *dgo.Session, guildID string) *audio.Player {
-	v, _ := players.LoadOrStore(guildID, audio.NewPlayer(s, guildID))
+	if v, ok := players.Load(guildID); ok {
+		return v.(*audio.Player)
+	}
+	p := audio.NewPlayer(s, guildID)
+	p.OnQueueEnd = func() { autoplayMeme(s, guildID, p) }
+	v, _ := players.LoadOrStore(guildID, p)
 	return v.(*audio.Player)
 }
 
@@ -66,6 +72,8 @@ func RegisterMusicHandlers(s *dgo.Session) {
 			musicLoop(s, m, args)
 		case "!disconnect", "!dc":
 			musicDisconnect(s, m)
+		case "!random", "!r":
+			musicRandom(s, m, args)
 		case "!meme", "!memes":
 			musicMeme(s, m, args)
 		case "!help", "!h":
@@ -81,31 +89,47 @@ func musicPlay(s *dgo.Session, m *dgo.MessageCreate, args []string) {
 		_, _ = s.ChannelMessageSend(m.ChannelID, "❌ Usage: `!play <song name or URL>`")
 		return
 	}
+	playQueries(s, m, []string{strings.Join(args, " ")}, "")
+}
 
+// playQueries joins the author's voice channel and queues the first of
+// queries that yt-dlp can find. note, if set, is shown on the result embed.
+func playQueries(s *dgo.Session, m *dgo.MessageCreate, queries []string, note string) {
 	vcID := userVoiceChannel(s, m.GuildID, m.Author.ID)
 	if vcID == "" {
 		_, _ = s.ChannelMessageSend(m.ChannelID, "❌ Join a voice channel first.")
 		return
 	}
+	if problem := voiceAccessProblem(s, m.GuildID, vcID); problem != "" {
+		_, _ = s.ChannelMessageSend(m.ChannelID, "❌ "+problem)
+		return
+	}
 
 	textChannels.Store(m.GuildID, m.ChannelID)
-
-	query := strings.Join(args, " ")
-	msg, _ := s.ChannelMessageSend(m.ChannelID, "🔍 Searching...")
+	status := sendStatus(s, m.ChannelID, "🔍 Searching...")
 
 	go func() {
-		song, err := audio.Resolve(query, m.Author.Username)
+		var song *audio.Song
+		var err error
+		for _, q := range queries {
+			if song, err = audio.Resolve(q, m.Author.Username); err == nil {
+				break
+			}
+			log.Printf("[Music] Couldn't resolve %q: %v", q, err)
+		}
 		if err != nil {
-			_, _ = s.ChannelMessageEdit(m.ChannelID, msg.ID, fmt.Sprintf("❌ Nothing found for **%s**", query))
+			status.text(fmt.Sprintf("❌ Nothing found for **%s**", queries[0]))
 			return
 		}
 
 		p := getOrCreatePlayer(s, m.GuildID)
 
 		if err := p.JoinChannel(vcID); err != nil {
-			_, _ = s.ChannelMessageEdit(m.ChannelID, msg.ID, fmt.Sprintf("❌ Can't join voice: %v", err))
+			log.Printf("[Music] Joining %s in guild %s: %v", vcID, m.GuildID, err)
+			status.text(fmt.Sprintf("❌ I couldn't connect to <#%s>. Check I can **View Channel**, **Connect** and **Speak** there, then try again.", vcID))
 			return
 		}
+		stageNote := speakOnStage(s, m.GuildID, vcID)
 
 		pos := p.Enqueue(song)
 
@@ -126,8 +150,17 @@ func musicPlay(s *dgo.Session, m *dgo.MessageCreate, args []string) {
 				},
 			}
 		}
+		for _, line := range []string{note, stageNote} {
+			if line == "" {
+				continue
+			}
+			if embed.Description != "" {
+				embed.Description += "\n"
+			}
+			embed.Description += line
+		}
 
-		_, _ = s.ChannelMessageEditEmbed(m.ChannelID, msg.ID, embed)
+		status.embed(embed)
 	}()
 }
 
@@ -283,6 +316,7 @@ func musicLoop(s *dgo.Session, m *dgo.MessageCreate, args []string) {
 func musicHelp(s *dgo.Session, m *dgo.MessageCreate) {
 	commands := []struct{ usage, desc string }{
 		{"!play <song or URL>", "Play a song or add it to the queue · `!p`"},
+		{"!random [tag]", "Play a random song · `!r` · tags: " + strings.Join(randomTagNames(), ", ")},
 		{"!skip", "Skip the current song · `!s`"},
 		{"!pause", "Pause playback"},
 		{"!resume", "Resume playback"},

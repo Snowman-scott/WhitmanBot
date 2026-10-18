@@ -32,7 +32,7 @@ func RegisterWhitmanHandlers(sess *dgo.Session) {
 			},
 		})
 		if err != nil {
-			log.Fatalf("Cannot create slash command: %v", err)
+			log.Printf("Cannot create slash command: %v", err)
 		}
 	})
 

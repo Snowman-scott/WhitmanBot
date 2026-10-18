@@ -41,6 +41,11 @@ type Player struct {
 	volume   int // 0–100
 
 	idleSince time.Time // when playback last stopped (or the bot joined)
+	stopped   bool      // Stop was called and nothing has been queued since
+
+	// OnQueueEnd, if set, runs in its own goroutine when the queue runs out
+	// on its own: not after Stop, and not when the voice connection failed.
+	OnQueueEnd func()
 }
 
 func NewPlayer(sess *dgo.Session, guildID string) *Player {
@@ -62,20 +67,41 @@ func (p *Player) JoinChannel(channelID string) error {
 		return nil
 	}
 
-	// mute=false, deaf=true (self-deafen)
-	vc, err := p.sess.ChannelVoiceJoin(p.guildID, channelID, false, true)
-	if err != nil {
-		return err
+	var err error
+	for attempt := 1; attempt <= 2; attempt++ {
+		// mute=false, deaf=true (self-deafen)
+		var vc *dgo.VoiceConnection
+		vc, err = p.sess.ChannelVoiceJoin(p.guildID, channelID, false, true)
+		if err == nil {
+			p.vc = vc
+			p.idleSince = time.Now()
+			return nil
+		}
+		log.Printf("[Player] Voice join attempt %d in guild %s failed: %v", attempt, p.guildID, err)
+		// A failed join can leave a half-open connection behind that makes
+		// every later join fail too. Tear it down so the retry starts clean.
+		p.dropVoiceLocked()
 	}
-	p.vc = vc
-	p.idleSince = time.Now()
-	return nil
+	return err
+}
+
+// dropVoiceLocked disconnects whatever voice connection the session holds
+// for this guild. p.mu must be held.
+func (p *Player) dropVoiceLocked() {
+	p.sess.RLock()
+	vc := p.sess.VoiceConnections[p.guildID]
+	p.sess.RUnlock()
+	if vc != nil {
+		_ = vc.Disconnect()
+	}
+	p.vc = nil
 }
 
 // Enqueue adds a song and starts playback if nothing is running.
 // Returns the 1-based queue position, or 0 if it will play immediately.
 func (p *Player) Enqueue(song *Song) int {
 	p.mu.Lock()
+	p.stopped = false
 	p.queue = append(p.queue, song)
 	pos := len(p.queue)
 	wasPlaying := p.playing
@@ -116,6 +142,7 @@ func (p *Player) Stop() {
 	p.mu.Lock()
 	p.queue = nil
 	p.paused = false
+	p.stopped = true
 	p.mu.Unlock()
 
 	p.Skip()
@@ -183,6 +210,13 @@ func (p *Player) IsPlaying() bool {
 	return p.playing
 }
 
+// WasStopped reports whether Stop was called with nothing queued since.
+func (p *Player) WasStopped() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.stopped
+}
+
 func (p *Player) IsPaused() bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -226,13 +260,18 @@ func (p *Player) playbackLoop() {
 	p.playing = true
 	p.mu.Unlock()
 
+	ranOut := false // the queue emptied after a track played without error
 	defer func() {
 		p.mu.Lock()
 		p.playing = false
 		p.current = nil
 		p.paused = false
 		p.idleSince = time.Now()
+		autoplay := ranOut && !p.stopped && p.OnQueueEnd != nil
 		p.mu.Unlock()
+		if autoplay {
+			go p.OnQueueEnd()
+		}
 	}()
 
 	for {
@@ -267,6 +306,7 @@ func (p *Player) playbackLoop() {
 			p.mu.Unlock()
 			return
 		}
+		ranOut = false
 
 		p.current = next
 		vc := p.vc
@@ -279,6 +319,8 @@ func (p *Player) playbackLoop() {
 
 		if err := p.playTrack(vc, next, vol); err != nil {
 			log.Printf("[Player] Playback finished for %q (%v)", next.Title, err)
+		} else {
+			ranOut = true
 		}
 
 		// Drain any leftover skip signal from a completed track
@@ -291,6 +333,11 @@ func (p *Player) playbackLoop() {
 
 func (p *Player) playTrack(vc *dgo.VoiceConnection, song *Song, vol int) error {
 	if !waitVoiceReady(vc, 10*time.Second) {
+		p.mu.Lock()
+		if p.vc == vc {
+			p.vc = nil // force a rejoin on the next !play
+		}
+		p.mu.Unlock()
 		return errors.New("voice connection never became ready")
 	}
 
